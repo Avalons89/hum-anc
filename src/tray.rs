@@ -9,8 +9,8 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 use crate::audio::AppResult;
 
 pub const HOTKEY_LABEL: &str = "Ctrl+Alt+M";
-const ICON_SIZE: u32 = 32;
-const ICON_RADIUS: f32 = 14.0;
+/// Matches the icon id in assets/hum-anc.rc.
+const APP_ICON_RESOURCE: u16 = 1;
 
 /// What the tray icon, its menu and the hotkey ask the app to do.
 pub enum Command {
@@ -116,16 +116,7 @@ fn forwarder(
     }
 }
 
-/// A plain teal dot, drawn in code so the app ships without image files.
+/// The app icon that build.rs embeds in the exe.
 fn tray_icon_image() -> AppResult<Icon> {
-    let center = (ICON_SIZE as f32 - 1.0) / 2.0;
-    let rgba = (0..ICON_SIZE * ICON_SIZE)
-        .flat_map(|i| {
-            let (x, y) = ((i % ICON_SIZE) as f32, (i / ICON_SIZE) as f32);
-            let distance = (x - center).hypot(y - center);
-            let alpha = ((ICON_RADIUS - distance).clamp(0.0, 1.0) * 255.0) as u8;
-            [0x3a, 0xa8, 0xc1, alpha]
-        })
-        .collect();
-    Ok(Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE)?)
+    Ok(Icon::from_resource(APP_ICON_RESOURCE, None)?)
 }

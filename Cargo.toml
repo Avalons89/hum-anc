@@ -9,3 +9,6 @@ eframe = { version = "0.37.0", features = ["persistence"] }
 global-hotkey = "0.10.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tray-icon = "0.26.1"
+
+[build-dependencies]
+embed-resource = "3.0.12"

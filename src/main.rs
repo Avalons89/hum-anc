@@ -13,7 +13,11 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([460.0, 450.0])
             .with_min_inner_size([420.0, 420.0])
-            .with_visible(!start_hidden),
+            .with_visible(!start_hidden)
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                    .expect("the bundled icon is a valid PNG"),
+            ),
         // A restored older, smaller size would push the Start button off the window.
         persist_window: false,
         ..Default::default()
