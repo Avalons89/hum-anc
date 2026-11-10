@@ -14,6 +14,8 @@ fn main() -> eframe::Result {
             .with_inner_size([460.0, 450.0])
             .with_min_inner_size([420.0, 420.0])
             .with_visible(!start_hidden),
+        // A restored older, smaller size would push the Start button off the window.
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(

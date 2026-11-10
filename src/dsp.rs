@@ -209,17 +209,25 @@ impl Noise {
 /// Rumble and desk thumps below this corner don't count toward room loudness.
 const METER_HIGHPASS_HZ: f32 = 150.0;
 const SLICE_SECONDS: f32 = 0.05;
+/// Slices are judged in 5 ms parts, so one that only partly overlaps a gated stretch is caught too.
+const SUB_BLOCKS_PER_SLICE: usize = 10;
 /// 3 s of slices: typing and speech always pause within that, so the quietest slice is background.
 const FLOOR_WINDOW_SLICES: usize = 60;
 const FLOOR_SMOOTHING_SECONDS: f32 = 0.5;
+/// No real room is this quiet; 5 ms below it means a mic's noise gate has cut the signal.
+const GATED_DB: f32 = -115.0;
 pub const SILENCE_DB: f32 = -120.0;
 
 /// Background loudness in dBFS: the quietest 50 ms slice of the last 3 s, lightly smoothed.
+/// Slices touched by a mic's noise gate are left out, since gated silence isn't the room.
 pub struct RoomMeter {
     highpass: [Highpass; 2],
-    slice_len: usize,
+    sub_block_len: usize,
+    sub_block_energy: f32,
+    sub_block_fill: usize,
     slice_energy: f32,
-    slice_fill: usize,
+    slice_sub_blocks: usize,
+    slice_gated: bool,
     recent_slices_db: VecDeque<f32>,
     smoothing: f32,
     level_db: f32,
@@ -229,9 +237,12 @@ impl RoomMeter {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             highpass: [Highpass::new(METER_HIGHPASS_HZ, sample_rate); 2],
-            slice_len: (SLICE_SECONDS * sample_rate) as usize,
+            sub_block_len: (SLICE_SECONDS * sample_rate) as usize / SUB_BLOCKS_PER_SLICE,
+            sub_block_energy: 0.0,
+            sub_block_fill: 0,
             slice_energy: 0.0,
-            slice_fill: 0,
+            slice_sub_blocks: 0,
+            slice_gated: false,
             recent_slices_db: VecDeque::with_capacity(FLOOR_WINDOW_SLICES),
             smoothing: -(-SLICE_SECONDS / FLOOR_SMOOTHING_SECONDS).exp_m1(),
             level_db: SILENCE_DB,
@@ -243,20 +254,35 @@ impl RoomMeter {
             .highpass
             .iter_mut()
             .fold(mic, |x, stage| stage.process(x));
-        self.slice_energy += audible * audible;
-        self.slice_fill += 1;
-        if self.slice_fill == self.slice_len {
+        self.sub_block_energy += audible * audible;
+        self.sub_block_fill += 1;
+        if self.sub_block_fill == self.sub_block_len {
+            self.close_sub_block();
+        }
+    }
+
+    fn close_sub_block(&mut self) {
+        if power_db(self.sub_block_energy / self.sub_block_len as f32) < GATED_DB {
+            self.slice_gated = true;
+        }
+        self.slice_energy += self.sub_block_energy;
+        self.sub_block_energy = 0.0;
+        self.sub_block_fill = 0;
+        self.slice_sub_blocks += 1;
+        if self.slice_sub_blocks == SUB_BLOCKS_PER_SLICE {
             self.close_slice();
         }
     }
 
     fn close_slice(&mut self) {
-        let slice_db = 10.0
-            * (self.slice_energy / self.slice_len as f32)
-                .max(1e-12)
-                .log10();
+        let slice_len = (self.sub_block_len * SUB_BLOCKS_PER_SLICE) as f32;
+        let slice_db = power_db(self.slice_energy / slice_len);
+        let gated = std::mem::take(&mut self.slice_gated);
         self.slice_energy = 0.0;
-        self.slice_fill = 0;
+        self.slice_sub_blocks = 0;
+        if gated {
+            return;
+        }
         if self.recent_slices_db.len() == FLOOR_WINDOW_SLICES {
             self.recent_slices_db.pop_front();
         }
@@ -277,6 +303,10 @@ impl RoomMeter {
     pub fn level_db(&self) -> f32 {
         self.level_db
     }
+}
+
+fn power_db(mean_square: f32) -> f32 {
+    10.0 * mean_square.max(1e-12).log10()
 }
 
 #[derive(Clone, Copy)]
@@ -455,6 +485,26 @@ mod tests {
         assert!(
             quiet_two_seconds <= 1.5,
             "still {quiet_two_seconds:.1} dB up 2 s after the room quieted"
+        );
+    }
+
+    #[test]
+    fn background_ignores_the_mics_gated_silence() {
+        let mut meter = RoomMeter::new(RATE);
+        let mut seed = 31;
+        // 1 s of near-digital silence every 2.5 s, like a mic whose noise gate keeps cutting in.
+        let period = (2.5 * RATE) as usize;
+        let gated = RATE as usize;
+
+        let room = feed(&mut meter, 6.0, |_| noise(&mut seed, 0.01));
+        let with_gate = feed(&mut meter, 8.0, |n| {
+            let amp = if n % period < gated { 1e-7 } else { 0.01 };
+            noise(&mut seed, amp)
+        }) - room;
+
+        assert!(
+            with_gate.abs() < 3.0,
+            "gated silence moved the background {with_gate:.1} dB"
         );
     }
 

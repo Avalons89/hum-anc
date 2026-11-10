@@ -81,6 +81,8 @@ pub struct App {
     tones: Vec<(f32, f32)>,
     controls: Option<Controls>,
     window_visible: bool,
+    /// eframe shows the window after its first frame regardless, so a tray start hides it again.
+    hide_after_first_frame: bool,
     quitting: bool,
     options_open: bool,
     start_with_windows: bool,
@@ -132,6 +134,7 @@ impl App {
             tones: Vec::new(),
             controls,
             window_visible,
+            hide_after_first_frame: !window_visible,
             quitting: false,
             options_open: false,
             start_with_windows: autostart::is_enabled(),
@@ -160,6 +163,18 @@ impl App {
                 }
             }
         }
+    }
+
+    fn finish_hidden_start(&mut self, ctx: &egui::Context) {
+        if !self.hide_after_first_frame {
+            return;
+        }
+        if ctx.cumulative_frame_nr() == 0 {
+            ctx.request_repaint();
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hide_after_first_frame = false;
     }
 
     fn set_window_visible(&mut self, ctx: &egui::Context, visible: bool) {
@@ -422,6 +437,7 @@ impl App {
 impl eframe::App for App {
     /// Runs every frame, and also while the window is hidden in the tray.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.finish_hidden_start(ctx);
         self.collect_scan();
         self.push_controls_to_audio();
         self.handle_commands(ctx);
