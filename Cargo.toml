@@ -1,0 +1,9 @@
+[package]
+name = "hum-anc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+eframe = { version = "0.37.0", features = ["persistence"] }
+serde = { version = "1.0.229", features = ["derive"] }
