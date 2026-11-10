@@ -7,6 +7,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::{self, Engine, Masking, StatusSlot, Tuning};
+use crate::tray::{Command, Controls, HOTKEY_LABEL};
 
 const MIN_OFFSET_DB: f32 = -40.0;
 const MAX_OFFSET_DB: f32 = 80.0;
@@ -65,6 +66,9 @@ pub struct App {
     engine: Option<Engine>,
     scan: Option<Receiver<ScanResult>>,
     tones: Vec<(f32, f32)>,
+    controls: Option<Controls>,
+    window_visible: bool,
+    quitting: bool,
 }
 
 impl App {
@@ -81,16 +85,65 @@ impl App {
         if !outputs.contains(&settings.output) {
             settings.output = audio::default_output_name().unwrap_or_default();
         }
+        let status = StatusSlot::default();
+        let controls = match Controls::new(&cc.egui_ctx) {
+            Ok(controls) => {
+                *status.lock().unwrap() = controls.hotkey_problem.clone();
+                Some(controls)
+            }
+            Err(err) => {
+                *status.lock().unwrap() = Some(format!("tray icon unavailable: {err}"));
+                None
+            }
+        };
         Self {
             settings,
             mics,
             outputs,
             masking: Arc::default(),
             tuning: Arc::default(),
-            status: StatusSlot::default(),
+            status,
             engine: None,
             scan: None,
             tones: Vec::new(),
+            controls,
+            window_visible: true,
+            quitting: false,
+        }
+    }
+
+    fn handle_commands(&mut self, ctx: &egui::Context) {
+        let Some(controls) = &self.controls else {
+            return;
+        };
+        let commands: Vec<Command> = controls.commands.try_iter().collect();
+        for command in commands {
+            match command {
+                Command::ToggleAudio => self.toggle_audio(),
+                Command::ToggleWindow => self.set_window_visible(ctx, !self.window_visible),
+                Command::ShowWindow => self.set_window_visible(ctx, true),
+                Command::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn set_window_visible(&mut self, ctx: &egui::Context, visible: bool) {
+        self.window_visible = visible;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        if visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
+    /// The close button hides to the tray; only the tray's Quit exits. Without a tray, close as usual.
+    fn hide_to_tray_on_close(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && self.controls.is_some() && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.set_window_visible(ctx, false);
         }
     }
 
@@ -102,9 +155,15 @@ impl App {
     }
 
     fn toggle_audio(&mut self) {
-        if self.engine.take().is_some() {
-            return;
+        if self.engine.take().is_none() {
+            self.start_audio();
         }
+        if let Some(controls) = &self.controls {
+            controls.show_running(self.engine.is_some());
+        }
+    }
+
+    fn start_audio(&mut self) {
         self.show_problem(None);
         let settings = &self.settings;
         let started = match settings.mode {
@@ -255,9 +314,18 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Runs every frame, and also while the window is hidden in the tray.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_scan();
         self.push_controls_to_audio();
+        self.handle_commands(ctx);
+        self.hide_to_tray_on_close(ctx);
+        if self.window_visible && (self.engine.is_some() || self.scan.is_some()) {
+            ctx.request_repaint_after(LIVE_REFRESH);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             let running = self.engine.is_some();
             ui.add_enabled_ui(!running, |ui| self.device_and_mode_pickers(ui));
@@ -267,17 +335,21 @@ impl eframe::App for App {
                 Mode::Hum => self.hum_tab(ui),
             }
             ui.add_space(8.0);
-            if ui.button(if running { "Stop" } else { "Start" }).clicked() {
-                self.toggle_audio();
-            }
+            ui.horizontal(|ui| {
+                if ui.button(if running { "Stop" } else { "Start" }).clicked() {
+                    self.toggle_audio();
+                }
+                if self.controls.is_some() {
+                    ui.weak(format!(
+                        "{HOTKEY_LABEL} anywhere; closing keeps it in the tray"
+                    ));
+                }
+            });
             let problem = self.status.lock().unwrap().clone();
             if let Some(problem) = problem {
                 ui.colored_label(ui.visuals().warn_fg_color, problem);
             }
         });
-        if self.engine.is_some() || self.scan.is_some() {
-            ui.ctx().request_repaint_after(LIVE_REFRESH);
-        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

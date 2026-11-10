@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 cpal = "0.18.2"
 eframe = { version = "0.37.0", features = ["persistence"] }
+global-hotkey = "0.10.0"
 serde = { version = "1.0.229", features = ["derive"] }
+tray-icon = "0.26.1"

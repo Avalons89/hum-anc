@@ -4,6 +4,7 @@
 mod audio;
 mod dsp;
 mod gui;
+mod tray;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
