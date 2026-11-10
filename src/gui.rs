@@ -184,7 +184,7 @@ impl App {
             (masking.room_db, masking.level_db())
         };
         egui::Grid::new("masking").num_columns(2).show(ui, |ui| {
-            ui.label("Room");
+            ui.label("Background");
             level_bar(ui, room_db, live);
             ui.end_row();
             ui.label("Masking");

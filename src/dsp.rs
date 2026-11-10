@@ -155,31 +155,32 @@ impl BrownNoise {
 
 /// Rumble and desk thumps below this corner don't count toward room loudness.
 const METER_HIGHPASS_HZ: f32 = 150.0;
-const METER_WINDOW_SECONDS: f32 = 0.05;
-/// Time constants that cover 95% of a change in ~1 s going up and ~5 s going down.
-const METER_RISE_SECONDS: f32 = 0.33;
-const METER_FALL_SECONDS: f32 = 1.7;
+const SLICE_SECONDS: f32 = 0.05;
+/// 3 s of slices: typing and speech always pause within that, so the quietest slice is background.
+const FLOOR_WINDOW_SLICES: usize = 60;
+const FLOOR_SMOOTHING_SECONDS: f32 = 0.5;
 pub const SILENCE_DB: f32 = -120.0;
 
-/// Room loudness in dBFS, smoothed to rise over ~1 s and fall over ~5 s.
+/// Background loudness in dBFS: the quietest 50 ms slice of the last 3 s, lightly smoothed.
 pub struct RoomMeter {
     highpass: [Highpass; 2],
-    window: f32,
-    rise: f32,
-    fall: f32,
-    mean_square: f32,
+    slice_len: usize,
+    slice_energy: f32,
+    slice_fill: usize,
+    recent_slices_db: VecDeque<f32>,
+    smoothing: f32,
     level_db: f32,
 }
 
 impl RoomMeter {
     pub fn new(sample_rate: f32) -> Self {
-        let per_sample = |seconds: f32| -(-1.0 / (seconds * sample_rate)).exp_m1();
         Self {
             highpass: [Highpass::new(METER_HIGHPASS_HZ, sample_rate); 2],
-            window: per_sample(METER_WINDOW_SECONDS),
-            rise: per_sample(METER_RISE_SECONDS),
-            fall: per_sample(METER_FALL_SECONDS),
-            mean_square: 0.0,
+            slice_len: (SLICE_SECONDS * sample_rate) as usize,
+            slice_energy: 0.0,
+            slice_fill: 0,
+            recent_slices_db: VecDeque::with_capacity(FLOOR_WINDOW_SLICES),
+            smoothing: -(-SLICE_SECONDS / FLOOR_SMOOTHING_SECONDS).exp_m1(),
             level_db: SILENCE_DB,
         }
     }
@@ -189,14 +190,35 @@ impl RoomMeter {
             .highpass
             .iter_mut()
             .fold(mic, |x, stage| stage.process(x));
-        self.mean_square += self.window * (audible * audible - self.mean_square);
-        let short_term_db = 10.0 * self.mean_square.max(1e-12).log10();
-        let speed = if short_term_db > self.level_db {
-            self.rise
+        self.slice_energy += audible * audible;
+        self.slice_fill += 1;
+        if self.slice_fill == self.slice_len {
+            self.close_slice();
+        }
+    }
+
+    fn close_slice(&mut self) {
+        let slice_db = 10.0
+            * (self.slice_energy / self.slice_len as f32)
+                .max(1e-12)
+                .log10();
+        self.slice_energy = 0.0;
+        self.slice_fill = 0;
+        if self.recent_slices_db.len() == FLOOR_WINDOW_SLICES {
+            self.recent_slices_db.pop_front();
+        }
+        self.recent_slices_db.push_back(slice_db);
+        let floor_db = self
+            .recent_slices_db
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        if self.recent_slices_db.len() == 1 {
+            // Start at the first reading instead of crawling up from silence.
+            self.level_db = floor_db;
         } else {
-            self.fall
-        };
-        self.level_db += speed * (short_term_db - self.level_db);
+            self.level_db += self.smoothing * (floor_db - self.level_db);
+        }
     }
 
     pub fn level_db(&self) -> f32 {
@@ -334,30 +356,55 @@ mod tests {
     }
 
     #[test]
-    fn room_meter_rises_within_a_second_and_falls_over_five() {
+    fn background_follows_a_steady_change_after_a_few_seconds() {
         let mut meter = RoomMeter::new(RATE);
         let mut seed = 5;
         let louder = 0.01 * 10f32.sqrt();
 
         let quiet = feed(&mut meter, 6.0, |_| noise(&mut seed, 0.01));
-        let after_tenth = feed(&mut meter, 0.1, |_| noise(&mut seed, louder)) - quiet;
-        let after_second = feed(&mut meter, 0.9, |_| noise(&mut seed, louder)) - quiet;
-        let quiet_one_second = feed(&mut meter, 1.0, |_| noise(&mut seed, 0.01)) - quiet;
-        let quiet_six_seconds = feed(&mut meter, 5.0, |_| noise(&mut seed, 0.01)) - quiet;
+        let after_one_second = feed(&mut meter, 1.0, |_| noise(&mut seed, louder)) - quiet;
+        let after_five_seconds = feed(&mut meter, 4.0, |_| noise(&mut seed, louder)) - quiet;
+        let quiet_two_seconds = feed(&mut meter, 2.0, |_| noise(&mut seed, 0.01)) - quiet;
 
-        assert!(after_tenth < 8.0, "jumped {after_tenth:.1} dB in 0.1 s");
         assert!(
-            after_second >= 8.5,
-            "rose only {after_second:.1} of 10 dB in 1 s"
+            after_one_second < 2.0,
+            "moved {after_one_second:.1} dB after 1 s"
         );
         assert!(
-            quiet_one_second >= 4.0,
-            "fell to {quiet_one_second:.1} dB within 1 s"
+            (after_five_seconds - 10.0).abs() <= 1.5,
+            "at {after_five_seconds:.1} of 10 dB after 5 s"
         );
         assert!(
-            quiet_six_seconds <= 1.0,
-            "still {quiet_six_seconds:.1} dB up after 6 s"
+            quiet_two_seconds <= 1.5,
+            "still {quiet_two_seconds:.1} dB up 2 s after the room quieted"
         );
+    }
+
+    #[test]
+    fn background_ignores_typing_and_talking() {
+        // (burst, period) in seconds: key clicks every 0.3 s, then 1.5 s phrases with 0.3 s pauses.
+        for (burst_seconds, period_seconds) in [(0.1, 0.3), (1.5, 1.8)] {
+            let mut meter = RoomMeter::new(RATE);
+            let mut seed = 21;
+            let burst = (burst_seconds * RATE) as usize;
+            let period = (period_seconds * RATE) as usize;
+            let thirty_db_louder = 0.01 * 31.6;
+
+            let room = feed(&mut meter, 6.0, |_| noise(&mut seed, 0.01));
+            let with_bursts = feed(&mut meter, 6.0, |n| {
+                let amp = if n % period < burst {
+                    thirty_db_louder
+                } else {
+                    0.01
+                };
+                noise(&mut seed, amp)
+            }) - room;
+
+            assert!(
+                with_bursts < 3.0,
+                "{burst_seconds} s bursts raised the background {with_bursts:.1} dB"
+            );
+        }
     }
 
     #[test]
