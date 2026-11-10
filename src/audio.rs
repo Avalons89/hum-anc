@@ -9,7 +9,7 @@ use cpal::{
     StreamInstant,
 };
 
-use crate::dsp::{BrownNoise, ClockBridge, HumTracker, RoomMeter, SILENCE_DB, loudest_tones};
+use crate::dsp::{ClockBridge, HumTracker, Noise, NoiseColor, RoomMeter, SILENCE_DB, steady_tones};
 
 pub type AppResult<T> = Result<T, Box<dyn Error>>;
 /// The latest audio problem worth showing, shared between the streams and the window.
@@ -24,7 +24,7 @@ const OUTPUT_CEILING: f32 = 0.03;
 /// Mic-to-ear delay to hold; it must cover the output buffer plus one input packet.
 const BRIDGE_DELAY_SECONDS: f64 = 0.1;
 /// Masking noise RMS never goes above this, for the same in-ear reason.
-const MASK_CEILING_DB: f32 = -30.0;
+pub const MASK_CEILING_DB: f32 = -30.0;
 /// Hard clip for brown-noise peaks, about -20 dBFS.
 const MASK_PEAK: f32 = 0.1;
 
@@ -43,6 +43,9 @@ impl Tuning {
 pub struct Masking {
     pub room_db: f32,
     pub offset_db: f32,
+    /// The user's own ceiling; the hard cap still applies above it.
+    pub max_db: f32,
+    pub color: NoiseColor,
 }
 
 impl Default for Masking {
@@ -50,13 +53,17 @@ impl Default for Masking {
         Self {
             room_db: SILENCE_DB,
             offset_db: 0.0,
+            max_db: MASK_CEILING_DB,
+            color: NoiseColor::Brown,
         }
     }
 }
 
 impl Masking {
     pub fn level_db(&self) -> f32 {
-        (self.room_db + self.offset_db).min(MASK_CEILING_DB)
+        (self.room_db + self.offset_db)
+            .min(self.max_db)
+            .min(MASK_CEILING_DB)
     }
 }
 
@@ -183,7 +190,7 @@ pub fn start_hum(
     })
 }
 
-/// Listens for a few seconds and returns the strongest steady tones as (hz, dB below the loudest).
+/// Listens for a few seconds and returns the clearest steady tones as (hz, dB above their surroundings).
 pub fn scan_for_hum(mic_name: &str) -> AppResult<Vec<(f32, f32)>> {
     let mic = find_device(cpal::default_host().input_devices()?, mic_name)?;
     let config: StreamConfig = mic.default_input_config()?.into();
@@ -203,16 +210,14 @@ pub fn scan_for_hum(mic_name: &str) -> AppResult<Vec<(f32, f32)>> {
     drop(stream);
 
     let samples = recording.lock().unwrap();
-    let tones = loudest_tones(
+    let tones = steady_tones(
         &samples,
         config.sample_rate as f32,
         SCAN_LOW_HZ,
         SCAN_HIGH_HZ,
     );
     if tones.is_empty() {
-        return Err(
-            "no tones found; check the mic isn't muted or running noise suppression".into(),
-        );
+        return Err("no hum found: nothing stands 20 dB above the background noise".into());
     }
     Ok(tones.into_iter().take(SCAN_TONES_SHOWN).collect())
 }
@@ -246,13 +251,17 @@ fn start_masking_noise(
     status: StatusSlot,
 ) -> AppResult<cpal::Stream> {
     let channels = usize::from(config.channels);
-    let mut noise = BrownNoise::default();
+    let mut noise = Noise::default();
     let stream = out.build_output_stream(
         config,
         move |data: &mut [f32], _: &OutputCallbackInfo| {
-            let amplitude = 10f32.powf(masking.lock().unwrap().level_db() / 20.0);
+            let (amplitude, color) = {
+                let masking = masking.lock().unwrap();
+                (10f32.powf(masking.level_db() / 20.0), masking.color)
+            };
             for frame in data.chunks_mut(channels) {
-                frame.fill((amplitude * noise.next_sample()).clamp(-MASK_PEAK, MASK_PEAK));
+                let sample = amplitude * noise.next_sample(color);
+                frame.fill(sample.clamp(-MASK_PEAK, MASK_PEAK));
             }
         },
         report_to(status),
@@ -323,5 +332,27 @@ fn report_to(status: StatusSlot) -> impl FnMut(cpal::Error) + Send + 'static {
         if !matches!(err.kind(), ErrorKind::Xrun) {
             *status.lock().unwrap() = Some(err.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masking_never_exceeds_the_users_max_or_the_hard_cap() {
+        let loud_room = Masking {
+            room_db: -40.0,
+            offset_db: 30.0,
+            max_db: -45.0,
+            ..Masking::default()
+        };
+        let max_set_above_cap = Masking {
+            max_db: -10.0,
+            ..loud_room
+        };
+
+        assert_eq!(loud_room.level_db(), -45.0);
+        assert_eq!(max_set_above_cap.level_db(), MASK_CEILING_DB);
     }
 }

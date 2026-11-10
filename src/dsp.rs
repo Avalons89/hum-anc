@@ -1,10 +1,17 @@
 use std::collections::VecDeque;
 use std::f64::consts::TAU;
 
-const SCAN_STEP_HZ: f32 = 0.5;
+use serde::{Deserialize, Serialize};
 
-/// Steady tones between `lo` and `hi` Hz as (hz, dB below the loudest), loudest first.
-pub fn loudest_tones(samples: &[f32], sample_rate: f32, lo: f32, hi: f32) -> Vec<(f32, f32)> {
+const SCAN_STEP_HZ: f32 = 0.5;
+/// Random noise peaks reach about 13 dB above their surroundings; a real hum clears this.
+const MIN_PROMINENCE_DB: f32 = 20.0;
+/// A peak is compared with the spectrum within ±20 Hz of it, minus its own ±2 Hz.
+const SURROUND_BINS: usize = 40;
+const OWN_PEAK_BINS: usize = 4;
+
+/// Steady tones between `lo` and `hi` Hz as (hz, dB above their surroundings), clearest first.
+pub fn steady_tones(samples: &[f32], sample_rate: f32, lo: f32, hi: f32) -> Vec<(f32, f32)> {
     let len = samples.len() as f64;
     // Hann window keeps low-frequency rumble from leaking into the scan range.
     let windowed: Vec<f64> = samples
@@ -21,16 +28,27 @@ pub fn loudest_tones(samples: &[f32], sample_rate: f32, lo: f32, hi: f32) -> Vec
         .map(|&f| goertzel_power(&windowed, f64::from(f / sample_rate)))
         .collect();
 
-    let mut peaks: Vec<(f32, f64)> = (1..power.len().saturating_sub(1))
+    let mut tones: Vec<(f32, f32)> = (1..power.len().saturating_sub(1))
         .filter(|&i| power[i] > power[i - 1] && power[i] >= power[i + 1])
-        .map(|i| (freqs[i], power[i]))
+        .map(|i| {
+            let prominence_db = 10.0 * (power[i] / surrounding_power(&power, i)).log10();
+            (freqs[i], prominence_db as f32)
+        })
+        .filter(|&(_, prominence_db)| prominence_db >= MIN_PROMINENCE_DB)
         .collect();
-    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let loudest = peaks.first().map_or(1.0, |&(_, p)| p);
-    peaks
-        .into_iter()
-        .map(|(hz, p)| (hz, (10.0 * (p / loudest).log10()) as f32))
-        .collect()
+    tones.sort_by(|a, b| b.1.total_cmp(&a.1));
+    tones
+}
+
+/// Median power around a peak, which ignores the peak and any neighbouring tones.
+fn surrounding_power(power: &[f64], peak: usize) -> f64 {
+    let window = peak.saturating_sub(SURROUND_BINS)..(peak + SURROUND_BINS + 1).min(power.len());
+    let mut around: Vec<f64> = window
+        .filter(|&j| j.abs_diff(peak) > OWN_PEAK_BINS)
+        .map(|j| power[j])
+        .collect();
+    around.sort_by(f64::total_cmp);
+    around.get(around.len() / 2).copied().unwrap_or(0.0)
 }
 
 /// Settles in ~4000 samples (80 ms at 48 kHz) and follows a hum up to ~1 Hz off the set pitch.
@@ -131,25 +149,60 @@ impl ClockBridge {
 
 /// The leak keeps the integrator from drifting; it puts the bass corner near 15 Hz at 48 kHz.
 const BROWN_LEAK: f32 = 0.998;
+/// Measured: brings Kellet's filter output to unit RMS for uniform white input.
+const PINK_SCALE: f32 = 0.55;
 
-/// Deep "waterfall" masking noise: power falls 6 dB per octave.
-#[derive(Default)]
-pub struct BrownNoise {
-    seed: u32,
-    value: f32,
+/// Brown falls 6 dB per octave (deep, like a waterfall), pink 3 dB (rain), white is flat (hiss).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum NoiseColor {
+    #[default]
+    Brown,
+    Pink,
+    White,
 }
 
-impl BrownNoise {
-    /// Next sample at roughly unit RMS.
-    pub fn next_sample(&mut self) -> f32 {
+/// Masking noise in any color at roughly unit RMS. Every filter runs on every sample,
+/// so switching color picks up a filter that has already settled.
+#[derive(Default)]
+pub struct Noise {
+    seed: u32,
+    brown: f32,
+    pink: [f32; 7],
+}
+
+impl Noise {
+    pub fn next_sample(&mut self, color: NoiseColor) -> f32 {
+        let white = self.next_white();
+        self.brown = BROWN_LEAK * self.brown + white;
+        let pink = self.next_pink(white);
+        // Uniform white noise has variance 1/3, hence the square roots of 3.
+        match color {
+            NoiseColor::Brown => self.brown * (3.0 * (1.0 - BROWN_LEAK * BROWN_LEAK)).sqrt(),
+            NoiseColor::Pink => pink * PINK_SCALE,
+            NoiseColor::White => white * 3f32.sqrt(),
+        }
+    }
+
+    fn next_white(&mut self) -> f32 {
         self.seed = self
             .seed
             .wrapping_mul(1_664_525)
             .wrapping_add(1_013_904_223);
-        let white = self.seed as f32 / u32::MAX as f32 * 2.0 - 1.0;
-        self.value = BROWN_LEAK * self.value + white;
-        // Uniform white noise has variance 1/3; this scales the leaky sum back to unit RMS.
-        self.value * (3.0 * (1.0 - BROWN_LEAK * BROWN_LEAK)).sqrt()
+        self.seed as f32 / u32::MAX as f32 * 2.0 - 1.0
+    }
+
+    /// Paul Kellet's pink filter: leaky stages whose sum slopes at -3 dB per octave.
+    fn next_pink(&mut self, white: f32) -> f32 {
+        let b = &mut self.pink;
+        b[0] = 0.99886 * b[0] + white * 0.055_517_9;
+        b[1] = 0.99332 * b[1] + white * 0.075_075_9;
+        b[2] = 0.96900 * b[2] + white * 0.153_852;
+        b[3] = 0.86650 * b[3] + white * 0.310_485_6;
+        b[4] = 0.55000 * b[4] + white * 0.532_952_2;
+        b[5] = -0.7616 * b[5] - white * 0.016_898;
+        let pink = b[0] + b[1] + b[2] + b[3] + b[4] + b[5] + b[6] + white * 0.5362;
+        b[6] = white * 0.115_926;
+        pink
     }
 }
 
@@ -279,9 +332,23 @@ mod tests {
             .map(|n| 0.05 * (TAU * 175.0 * n as f32 / RATE).sin() + noise(&mut seed, 0.2))
             .collect();
 
-        let (hz, _) = loudest_tones(&samples, RATE, 100.0, 300.0)[0];
+        let (hz, prominence_db) = steady_tones(&samples, RATE, 100.0, 300.0)[0];
 
         assert!((hz - 175.0).abs() <= 0.5, "found {hz} Hz");
+        assert!(
+            prominence_db >= 20.0,
+            "only {prominence_db:.1} dB above the noise"
+        );
+    }
+
+    #[test]
+    fn reports_no_tones_in_plain_noise() {
+        let mut seed = 13;
+        let samples: Vec<f32> = (0..RATE as usize).map(|_| noise(&mut seed, 0.2)).collect();
+
+        let tones = steady_tones(&samples, RATE, 100.0, 1000.0);
+
+        assert!(tones.is_empty(), "noise reported as tones: {tones:?}");
     }
 
     #[test]
@@ -337,22 +404,33 @@ mod tests {
     }
 
     #[test]
-    fn brown_noise_is_deep_and_near_unit_level() {
-        let mut brown = BrownNoise::default();
-        let samples: Vec<f64> = (0..2 * RATE as usize)
-            .map(|_| f64::from(brown.next_sample()))
-            .collect();
-        let rms_db =
-            10.0 * (samples.iter().map(|s| s * s).sum::<f64>() / samples.len() as f64).log10();
-        let band_power = |low_hz: f64| -> f64 {
-            (0..21)
-                .map(|i| goertzel_power(&samples, (low_hz + f64::from(i)) / f64::from(RATE)))
-                .sum()
-        };
-        let tilt_db = 10.0 * (band_power(90.0) / band_power(990.0)).log10();
+    fn each_noise_color_has_its_slope_at_unit_level() {
+        // Power drop from 100 Hz to 1 kHz: one decade at -6, -3 and 0 dB per octave.
+        let colors = [
+            (NoiseColor::Brown, 20.0),
+            (NoiseColor::Pink, 10.0),
+            (NoiseColor::White, 0.0),
+        ];
+        for (color, expected_tilt_db) in colors {
+            let mut noise = Noise::default();
+            let samples: Vec<f64> = (0..2 * RATE as usize)
+                .map(|_| f64::from(noise.next_sample(color)))
+                .collect();
+            let rms_db =
+                10.0 * (samples.iter().map(|s| s * s).sum::<f64>() / samples.len() as f64).log10();
+            let band_power = |low_hz: f64| -> f64 {
+                (0..21)
+                    .map(|i| goertzel_power(&samples, (low_hz + f64::from(i)) / f64::from(RATE)))
+                    .sum()
+            };
+            let tilt_db = 10.0 * (band_power(90.0) / band_power(990.0)).log10();
 
-        assert!(rms_db.abs() <= 1.0, "level {rms_db:.1} dB");
-        assert!(tilt_db >= 15.0, "100 Hz only {tilt_db:.1} dB above 1 kHz");
+            assert!(rms_db.abs() <= 1.0, "{color:?} level {rms_db:.1} dB");
+            assert!(
+                (tilt_db - expected_tilt_db).abs() <= 3.0,
+                "{color:?} drops {tilt_db:.1} dB per decade, expected {expected_tilt_db}"
+            );
+        }
     }
 
     #[test]

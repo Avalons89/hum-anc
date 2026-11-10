@@ -1,18 +1,22 @@
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::audio::{self, Engine, Masking, StatusSlot, Tuning};
+use crate::audio::{self, Engine, MASK_CEILING_DB, Masking, StatusSlot, Tuning};
+use crate::autostart;
+use crate::dsp::NoiseColor;
 use crate::tray::{Command, Controls, HOTKEY_LABEL};
 
 const MIN_OFFSET_DB: f32 = -40.0;
 const MAX_OFFSET_DB: f32 = 80.0;
 const MIN_GAIN_DB: f32 = -40.0;
 const MAX_GAIN_DB: f32 = 40.0;
+const QUIETEST_MAX_DB: f32 = -60.0;
 const BAR_FLOOR_DB: f32 = -100.0;
 const BAR_TOP_DB: f32 = -20.0;
 const BAR_WIDTH: f32 = 240.0;
@@ -20,6 +24,9 @@ const BAR_WIDTH: f32 = 240.0;
 const SLIDER_WIDTH: f32 = 170.0;
 const COMBO_WIDTH: f32 = 280.0;
 const LIVE_REFRESH: Duration = Duration::from_millis(100);
+/// 30 s of history at one point per LIVE_REFRESH.
+const GRAPH_POINTS: usize = 300;
+const GRAPH_HEIGHT: f32 = 80.0;
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum Mode {
@@ -35,9 +42,12 @@ struct Settings {
     output: String,
     mode: Mode,
     offset_db: f32,
+    max_db: f32,
+    color: NoiseColor,
     hum_hz: f32,
     phase_deg: f32,
     gain_db: f32,
+    start_audio_on_open: bool,
 }
 
 impl Default for Settings {
@@ -47,9 +57,12 @@ impl Default for Settings {
             output: String::new(),
             mode: Mode::Masking,
             offset_db: 0.0,
+            max_db: MASK_CEILING_DB,
+            color: NoiseColor::Brown,
             hum_hz: 100.0,
             phase_deg: 180.0,
             gain_db: 0.0,
+            start_audio_on_open: false,
         }
     }
 }
@@ -69,10 +82,15 @@ pub struct App {
     controls: Option<Controls>,
     window_visible: bool,
     quitting: bool,
+    options_open: bool,
+    start_with_windows: bool,
+    /// (background, masking) in dBFS, oldest first.
+    history: VecDeque<(f32, f32)>,
+    last_history_point: Instant,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, start_hidden: bool) -> Self {
         let mut settings: Settings = cc
             .storage
             .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
@@ -96,7 +114,13 @@ impl App {
                 None
             }
         };
-        Self {
+        // Without a tray icon a hidden window could never be reopened.
+        let window_visible = !start_hidden || controls.is_none();
+        if window_visible && start_hidden {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        let mut app = Self {
             settings,
             mics,
             outputs,
@@ -107,9 +131,17 @@ impl App {
             scan: None,
             tones: Vec::new(),
             controls,
-            window_visible: true,
+            window_visible,
             quitting: false,
+            options_open: false,
+            start_with_windows: autostart::is_enabled(),
+            history: VecDeque::with_capacity(GRAPH_POINTS),
+            last_history_point: Instant::now(),
+        };
+        if app.settings.start_audio_on_open {
+            app.toggle_audio();
         }
+        app
     }
 
     fn handle_commands(&mut self, ctx: &egui::Context) {
@@ -148,10 +180,31 @@ impl App {
     }
 
     fn push_controls_to_audio(&self) {
-        self.masking.lock().unwrap().offset_db = self.settings.offset_db;
+        {
+            let mut masking = self.masking.lock().unwrap();
+            masking.offset_db = self.settings.offset_db;
+            masking.max_db = self.settings.max_db;
+            masking.color = self.settings.color;
+        }
         let mut tuning = self.tuning.lock().unwrap();
         tuning.phase_deg = self.settings.phase_deg;
         tuning.gain_db = self.settings.gain_db;
+    }
+
+    fn record_history(&mut self) {
+        let masking_runs = self.engine.is_some() && self.settings.mode == Mode::Masking;
+        if !masking_runs || self.last_history_point.elapsed() < LIVE_REFRESH {
+            return;
+        }
+        self.last_history_point = Instant::now();
+        let point = {
+            let masking = self.masking.lock().unwrap();
+            (masking.room_db, masking.level_db())
+        };
+        if self.history.len() == GRAPH_POINTS {
+            self.history.pop_front();
+        }
+        self.history.push_back(point);
     }
 
     fn toggle_audio(&mut self) {
@@ -165,6 +218,8 @@ impl App {
 
     fn start_audio(&mut self) {
         self.show_problem(None);
+        self.push_controls_to_audio();
+        self.history.clear();
         let settings = &self.settings;
         let started = match settings.mode {
             Mode::Masking => audio::start_masking(
@@ -205,8 +260,8 @@ impl App {
         match receiver.try_recv() {
             Err(TryRecvError::Empty) => return,
             Ok(Ok(tones)) => {
-                if let Some(&(loudest_hz, _)) = tones.first() {
-                    self.settings.hum_hz = loudest_hz;
+                if let Some(&(clearest_hz, _)) = tones.first() {
+                    self.settings.hum_hz = clearest_hz;
                 }
                 self.tones = tones;
             }
@@ -220,7 +275,7 @@ impl App {
         *self.status.lock().unwrap() = problem;
     }
 
-    fn device_and_mode_pickers(&mut self, ui: &mut egui::Ui) {
+    fn device_pickers(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("devices").num_columns(2).show(ui, |ui| {
             ui.label("Mic");
             device_combo(ui, "mic", &mut self.settings.mic, &self.mics);
@@ -229,9 +284,21 @@ impl App {
             device_combo(ui, "output", &mut self.settings.output, &self.outputs);
             ui.end_row();
         });
+    }
+
+    /// Mode tabs lock while audio runs; Options stays reachable.
+    fn tab_row(&mut self, ui: &mut egui::Ui, running: bool) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.settings.mode, Mode::Masking, "Masking");
-            ui.selectable_value(&mut self.settings.mode, Mode::Hum, "Hum");
+            ui.add_enabled_ui(!running, |ui| {
+                for (mode, label) in [(Mode::Masking, "Masking"), (Mode::Hum, "Hum")] {
+                    let selected = !self.options_open && self.settings.mode == mode;
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.settings.mode = mode;
+                        self.options_open = false;
+                    }
+                }
+            });
+            ui.toggle_value(&mut self.options_open, "Options");
         });
     }
 
@@ -256,7 +323,24 @@ impl App {
                     .fixed_decimals(1),
             );
             ui.end_row();
+            ui.label("Max volume");
+            ui.add(
+                egui::Slider::new(&mut self.settings.max_db, QUIETEST_MAX_DB..=MASK_CEILING_DB)
+                    .suffix(" dBFS")
+                    .fixed_decimals(0),
+            );
+            ui.end_row();
+            ui.label("Noise");
+            ui.horizontal(|ui| {
+                let color = &mut self.settings.color;
+                ui.selectable_value(color, NoiseColor::Brown, "Brown");
+                ui.selectable_value(color, NoiseColor::Pink, "Pink");
+                ui.selectable_value(color, NoiseColor::White, "White");
+            });
+            ui.end_row();
         });
+        ui.add_space(4.0);
+        level_graph(ui, &self.history);
     }
 
     fn hum_tab(&mut self, ui: &mut egui::Ui) {
@@ -274,12 +358,12 @@ impl App {
                 ui.spinner();
                 ui.label("listening for 3 s");
             } else if !self.tones.is_empty() {
-                ui.weak("a real hum stands 10+ dB above the next tone");
+                ui.weak("dB above the surrounding noise; click one to use it");
             }
         });
         ui.horizontal_wrapped(|ui| {
             for &(hz, db) in &self.tones {
-                let tone = egui::Button::new(format!("{hz:.1} Hz ({db:.0} dB)"));
+                let tone = egui::Button::new(format!("{hz:.1} Hz (+{db:.0} dB)"));
                 if ui.add_enabled(!running, tone).clicked() {
                     self.settings.hum_hz = hz;
                 }
@@ -311,6 +395,28 @@ impl App {
             ui.end_row();
         });
     }
+
+    fn options_tab(&mut self, ui: &mut egui::Ui) {
+        let mut start_with_windows = self.start_with_windows;
+        if ui
+            .checkbox(
+                &mut start_with_windows,
+                "Start with Windows, hidden in the tray",
+            )
+            .changed()
+        {
+            match autostart::set(start_with_windows) {
+                Ok(()) => self.start_with_windows = start_with_windows,
+                Err(err) => {
+                    self.show_problem(Some(format!("couldn't change Windows startup: {err}")))
+                }
+            }
+        }
+        ui.checkbox(
+            &mut self.settings.start_audio_on_open,
+            "Start audio when hum-anc opens",
+        );
+    }
 }
 
 impl eframe::App for App {
@@ -320,6 +426,7 @@ impl eframe::App for App {
         self.push_controls_to_audio();
         self.handle_commands(ctx);
         self.hide_to_tray_on_close(ctx);
+        self.record_history();
         if self.window_visible && (self.engine.is_some() || self.scan.is_some()) {
             ctx.request_repaint_after(LIVE_REFRESH);
         }
@@ -328,11 +435,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ui, |ui| {
             let running = self.engine.is_some();
-            ui.add_enabled_ui(!running, |ui| self.device_and_mode_pickers(ui));
+            ui.add_enabled_ui(!running, |ui| self.device_pickers(ui));
+            self.tab_row(ui, running);
             ui.separator();
-            match self.settings.mode {
-                Mode::Masking => self.masking_tab(ui),
-                Mode::Hum => self.hum_tab(ui),
+            if self.options_open {
+                self.options_tab(ui);
+            } else {
+                match self.settings.mode {
+                    Mode::Masking => self.masking_tab(ui),
+                    Mode::Hum => self.hum_tab(ui),
+                }
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -373,10 +485,49 @@ fn level_bar(ui: &mut egui::Ui, db: f32, live: bool) {
         ui.weak("stopped");
         return;
     }
-    let fraction = (db - BAR_FLOOR_DB) / (BAR_TOP_DB - BAR_FLOOR_DB);
     ui.add(
-        egui::ProgressBar::new(fraction)
+        egui::ProgressBar::new(bar_fraction(db))
             .desired_width(BAR_WIDTH)
             .text(format!("{db:.0} dBFS")),
     );
+}
+
+fn bar_fraction(db: f32) -> f32 {
+    ((db - BAR_FLOOR_DB) / (BAR_TOP_DB - BAR_FLOOR_DB)).clamp(0.0, 1.0)
+}
+
+/// Last 30 s of background and masking levels, newest at the right edge.
+fn level_graph(ui: &mut egui::Ui, history: &VecDeque<(f32, f32)>) {
+    let background_color = ui.visuals().weak_text_color();
+    let masking_color = ui.visuals().selection.bg_fill;
+    let size = egui::vec2(ui.available_width(), GRAPH_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(2),
+        ui.visuals().extreme_bg_color,
+    );
+    let step = rect.width() / (GRAPH_POINTS - 1) as f32;
+    let newest = history.len().saturating_sub(1);
+    let line = |level: fn(&(f32, f32)) -> f32| -> Vec<egui::Pos2> {
+        history
+            .iter()
+            .enumerate()
+            .map(|(i, point)| {
+                let x = rect.right() - (newest - i) as f32 * step;
+                egui::pos2(
+                    x,
+                    rect.bottom() - bar_fraction(level(point)) * rect.height(),
+                )
+            })
+            .collect()
+    };
+    painter.line(line(|p| p.0), egui::Stroke::new(1.5, background_color));
+    painter.line(line(|p| p.1), egui::Stroke::new(1.5, masking_color));
+    ui.horizontal(|ui| {
+        ui.colored_label(background_color, "background");
+        ui.colored_label(masking_color, "masking");
+        ui.weak("last 30 s");
+    });
 }
